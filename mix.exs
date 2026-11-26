@@ -5,6 +5,8 @@ defmodule LlvPglite.MixProject do
     [
       app: :llv_pglite,
       version: "0.1.0",
+      description: "Ecto on PGlite (Postgres in Wasm) for LocalLiveView apps",
+      package: [licenses: ["Apache-2.0"], links: %{"GitHub" => "https://github.com/Code-My-Spec/llv_pglite"}],
       elixir: "~> 1.19",
       deps: deps(),
       description:

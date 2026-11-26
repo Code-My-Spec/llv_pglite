@@ -27,3 +27,7 @@ Keep it out of the Wasm bundle with `exclude_priv: [llv_pglite: "*"]` in the
 `vendor/local_live_view` and `vendor/popcorn` are patched copies; see each
 `VENDORED.md`. LocalLiveView's TypeScript sources and node_modules are left
 out: its prebuilt `priv/static/local_live_view.js` ships instead.
+
+## License
+
+Apache-2.0. The vendored LocalLiveView and Popcorn are Apache-2.0 by Software Mansion; patches to them are listed in their `VENDORED.md`.
