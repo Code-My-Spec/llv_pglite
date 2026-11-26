@@ -1,0 +1,61 @@
+# Popcorn
+
+Popcorn runs Elixir and Erlang applications in the browser, with a JavaScript API for communication.
+
+It uses the BEAM virtual machine from Erlang/OTP, compiled to WebAssembly.
+Your application runs on the user's device, with BEAM processes, message passing, and supervision.
+
+## How it works
+
+The Vite, Rollup, and esbuild plugins package your compiled application and its dependencies as browser assets.
+Your Elixir and Erlang modules keep their BEAM bytecode format. The VM runs separately from the page's JavaScript thread.
+
+JavaScript sends messages to BEAM processes and receives their replies through the bridge.
+Elixir can also request JavaScript execution in the page, where browser APIs such as the DOM are available.
+Browser restrictions still apply to the VM, including limits on operating-system access and native libraries.
+
+## APIs
+
+- [JavaScript API](https://hexdocs.pm/popcorn/JSLib.Popcorn.html): start and stop the VM, send messages, and connect terminal input and output.
+- [Elixir JavaScript API](https://hexdocs.pm/popcorn/Popcorn.JS.html): send messages to JavaScript and call JavaScript functions from Elixir.
+- [GenServer proxy](https://hexdocs.pm/popcorn/Popcorn.Proxy.html): connect JavaScript calls and casts to your application's GenServers.
+- [HTTP API](https://hexdocs.pm/popcorn/Popcorn.Fetch.html): send HTTP requests through the browser, directly or with Req.
+
+## Installation
+
+Add the Elixir package to your Mix dependencies:
+
+```elixir
+defp deps do
+  [{:popcorn, "~> 1.0"}]
+end
+```
+
+Install the matching JavaScript package with `npm install @swmansion/popcorn@next`.
+The npm package includes both `core` and `crypto` runtime variants.
+The bundler plugin selects one from your application's dependencies.
+Use `config :popcorn, runtime_variant: :crypto` to override the selection. Both variants use this Hex package.
+
+Fetch your application dependencies with `mix deps.get` before building its JavaScript assets.
+The bundler plugin invokes `mix popcorn.cook`, which compiles and packages your application and its standard-library dependencies.
+Use the toolchain in [mise.toml](https://github.com/software-mansion/popcorn/blob/main/mise.toml) for this release.
+
+You can also prepare the complete browser asset directory without a JavaScript
+bundler:
+
+```console
+mix popcorn.cook --out-dir public/out
+```
+
+The task uses the current Mix application by default. Set
+`config :popcorn, app: nil` in `config/config.exs` to package the base runtime
+without an entrypoint. Configure all cooking settings there; `--out-dir` is the
+only CLI option and cannot be set in application config. The JS plugins use the
+same configuration. See `mix help popcorn.cook` for the available settings.
+
+Start with the [introduction](https://hexdocs.pm/popcorn/about.html).
+Then use the [first application tutorial](https://hexdocs.pm/popcorn/hello-world.html).
+
+The [JavaScript setup guide](https://github.com/software-mansion/popcorn/blob/main/popcorn/js/README.md)
+contains a short package reference. The documentation contains the
+complete Elixir and JavaScript API reference.

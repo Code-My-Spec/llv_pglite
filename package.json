@@ -1,0 +1,6 @@
+{
+  "name": "llv_pglite",
+  "version": "0.1.0",
+  "main": "./priv/static/llv_pglite.js",
+  "exports": {".": "./priv/static/llv_pglite.js"}
+}

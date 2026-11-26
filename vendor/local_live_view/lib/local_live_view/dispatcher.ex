@@ -1,0 +1,270 @@
+defmodule LocalLiveView.Dispatcher do
+  @moduledoc false
+
+  # Dispatcher is the entry point for messages from JS, which it
+  # routes to Local LiveViews. It receives two kinds of messages:
+  # - Actions from LLV's JS part. They include requests to create a LLV
+  #   and to dispatch data to LLVs directly (by sending a message to LLV's
+  #   process)
+  # - Phoenix transport frames. The dispatcher sits on the Phoenix.Socket.Transport
+  #   level (public API; the same thing that LV's websocket and longpool implement).
+  #   The frames are forwarded from JS to the Phoenix.LiveView.Socket and vice versa.
+
+  use GenServer
+  require Logger
+
+  alias __MODULE__.View
+
+  @process_name :local_live_view_dispatcher
+
+  @table :local_live_view_dispatcher
+
+  @doc false
+  def start_link(args) do
+    GenServer.start_link(__MODULE__, args, name: @process_name)
+  end
+
+  def current_assigns(id) do
+    case :ets.lookup(@table, {:assigns, id}) do
+      [{{:assigns, ^id}, assigns}] -> assigns
+      [] -> nil
+    end
+  end
+
+  def register_channel(id, epoch) do
+    send(@process_name, {:llv_register_channel, id, epoch, self()})
+    :ok
+  end
+
+  @doc """
+  Sends an event to LLV's JS part, see `handleEvent` in
+  assets/local_live_view/index.ts. It's sent straight from the calling
+  process, not through the dispatcher.
+  """
+  def send_to_js(event, payload) when is_atom(event) and is_map(payload) do
+    Popcorn.JS.send(Map.put(payload, :__llv__, event))
+  end
+
+  @impl true
+  def init(_init_arg) do
+    {:ok, transport} =
+      Phoenix.LiveView.Socket.connect(%{
+        endpoint: LocalLiveView.Endpoint,
+        transport: :popcorn,
+        options: [serializer: [{__MODULE__.Serializer, "~> 2.0"}]],
+        params: %{"vsn" => "2.0.0"},
+        connect_info: %{session: %{}}
+      })
+
+    {:ok, transport} = Phoenix.LiveView.Socket.init(transport)
+
+    :ets.new(@table, [:named_table])
+
+    {:ok, %{transport: transport, views: %{}}}
+  end
+
+  # Message/reply from the LiveView.Socket to the LiveView JS
+  @impl GenServer
+  def handle_info({:socket_push, _opcode, message}, state) do
+    push_to_browser(message, state)
+    {:noreply, state}
+  end
+
+  # Handle LLV's registration via register_channel/2
+  @impl GenServer
+  def handle_info({:llv_register_channel, id, epoch, pid}, state) do
+    case state.views[id] do
+      %View{epoch: ^epoch} ->
+        monitor_ref = Process.monitor(pid)
+        {:noreply, update_in(state.views[id], &View.register_channel(&1, pid, monitor_ref))}
+
+      _other ->
+        # The view was destroyed (and possibly re-created) while this
+        # channel's join was in flight — too early for the destroy to stop
+        # it (a pid is only known after registration), so stop it here.
+        Logger.debug("LLV #{id}: registration from a dead incarnation ignored")
+        Process.exit(pid, {:shutdown, :destroyed})
+        {:noreply, state}
+    end
+  end
+
+  # Handle LLV process' death
+  @impl GenServer
+  def handle_info({:DOWN, ref, :process, _pid, _reason} = msg, state) do
+    case Enum.find(state.views, fn {_id, view} -> view.monitor_ref == ref end) do
+      {id, view} ->
+        {:noreply, put_in(state.views[id], View.channel_down(view))}
+
+      nil ->
+        socket_handle_info(msg, state)
+    end
+  end
+
+  @impl GenServer
+  def handle_info(msg, state) do
+    socket_handle_info(msg, state)
+  end
+
+  @impl GenServer
+  def handle_call(%{"action" => "create", "id" => id} = msg, _from, state)
+      when not is_map_key(state.views, id) do
+    %{"view" => view, "mirror_id" => mirror_id, "assigns" => assigns} = msg
+
+    # When an LLV is created, destroyed/crashes and created again
+    # in a short period, there can be multiple LLV processes for
+    # a single LLV at the same time. Thus, we add a reference
+    # to make sure the LLV process registered with register/2
+    # is the newest one.
+    epoch = make_ref()
+
+    # The LLV needs the assigns at mount, and we get to know
+    # about its registration only after it mounts, thus we put
+    # assigns into an ETS table upfront, so the LLV can read
+    # them during mount.
+    if assigns, do: :ets.insert(@table, {{:assigns, id}, assigns})
+
+    main = msg["main"] == true
+    url = if main, do: msg["url"]
+    state = put_in(state.views[id], %View{epoch: epoch})
+
+    session = %{
+      "llv" => %{id: id, view: view, epoch: epoch, mirror_id: mirror_id, main: main, url: url}
+    }
+
+    {:reply, {:ok, %{html: View.render_container(id, session)}}, state}
+  end
+
+  @impl GenServer
+  def handle_call(%{"action" => "create"}, _from, state) do
+    {:reply, {:error, "error creating LLV"}, state}
+  end
+
+  # Frame sent by the JS transport. It's JSON-encoded, as over a websocket,
+  # and decoded by LocalLiveView.Dispatcher.Serializer.
+  @impl GenServer
+  def handle_call(
+        %{"action" => "transport_frame", "id" => id, "frame" => frame},
+        _from,
+        state
+      )
+      when is_map_key(state.views, id) do
+    case socket_in(state, frame) do
+      {:pending, state} ->
+        {:reply, :ok, state}
+
+      {{:reply, message}, state} ->
+        push_to_browser(message, state)
+        {:reply, :ok, state}
+    end
+  end
+
+  # When phx_leave comes, we may have removed the view from the state already
+  @impl GenServer
+  def handle_call(
+        %{"action" => "transport_frame", "event" => "phx_leave", "frame" => frame},
+        _from,
+        state
+      ) do
+    {_result, state} = socket_in(state, frame)
+    {:reply, :ok, state}
+  end
+
+  @impl GenServer
+  def handle_call(%{"action" => "transport_frame"}, _from, state) do
+    {:reply, {:error, "view not mounted"}, state}
+  end
+
+  @impl GenServer
+  def handle_call(
+        %{"action" => "update_assigns", "id" => id, "assigns" => assigns},
+        _from,
+        state
+      ) do
+    if view = state.views[id] do
+      :ets.insert(@table, {{:assigns, id}, assigns})
+      View.dispatch(view, {:llv, %{"action" => "update_assigns", "assigns" => assigns}})
+    end
+
+    {:reply, :ok, state}
+  end
+
+  # LLV-specific messages to be delivered to the view. See View.dispatch/2
+  @impl GenServer
+  def handle_call(
+        %{"action" => "dispatch_to_view", "id" => id, "payload" => payload},
+        _from,
+        state
+      ) do
+    case state.views[id] do
+      nil ->
+        Logger.debug("LLV #{id}: dispatch to a view that is not mounted ignored")
+        {:reply, :ok, state}
+
+      view ->
+        state = put_in(state.views[id], View.dispatch_queue(view, {:llv, payload}))
+        {:reply, :ok, state}
+    end
+  end
+
+  @impl GenServer
+  def handle_call(%{"action" => "destroy", "id" => id}, _from, state) do
+    :ets.delete(@table, {:assigns, id})
+    {view, views} = Map.pop(state.views, id)
+
+    if pid = get_in(view.channel_pid) do
+      # We need to stop the view manually because it's sticky.
+      # Thus, after a navigation, LiveView may not destroy the view
+      # even if its DOM element is destroyed (that's what triggers
+      # this action).
+      Process.exit(pid, {:shutdown, :destroyed})
+    end
+
+    {:reply, :ok, %{state | views: views}}
+  end
+
+  ## Socket plumbing
+
+  defp socket_in(state, frame) do
+    case Phoenix.LiveView.Socket.handle_in({frame, []}, state.transport) do
+      {:ok, transport} ->
+        {:pending, %{state | transport: transport}}
+
+      {:reply, _status, {_opcode, reply_message}, transport} ->
+        {{:reply, reply_message}, %{state | transport: transport}}
+    end
+  end
+
+  defp socket_handle_info(msg, state) do
+    case Phoenix.LiveView.Socket.handle_info(msg, state.transport) do
+      {:ok, transport} ->
+        {:noreply, %{state | transport: transport}}
+
+      {:push, {_opcode, message}, transport} ->
+        state = %{state | transport: transport}
+        push_to_browser(message, state)
+        {:noreply, state}
+
+      {:stop, reason, transport} ->
+        Logger.warning("LLV dispatcher ignoring socket stop: #{inspect(reason)}")
+        {:noreply, %{state | transport: transport}}
+    end
+  end
+
+  # `frame` is already JSON-encoded, see LocalLiveView.Dispatcher.Serializer
+  defp push_to_browser({topic, frame}, state) do
+    case topic_to_id(topic) do
+      nil ->
+        Logger.warning("LLV dispatcher: dropping push on unsupported topic #{inspect(topic)}")
+
+      id ->
+        if Map.has_key?(state.views, id) do
+          send_to_js(:transport_push, %{frame: frame})
+        end
+    end
+
+    :ok
+  end
+
+  defp topic_to_id("lv:" <> id), do: id
+  defp topic_to_id(_topic), do: nil
+end

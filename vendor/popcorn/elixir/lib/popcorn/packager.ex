@@ -1,0 +1,1170 @@
+defmodule Popcorn.Packager do
+  @moduledoc false
+
+  alias Popcorn.Packager.BeamPatcher
+  alias Popcorn.Packager.OtpApps
+
+  # :beam_lib.significant_chunks/0 is undocumented.
+  @retained_chunks :beam_lib.significant_chunks() -- [~c"Type"]
+  # Applications that only work when the emulator was built with the matching
+  # native support. The runtime manifest declares what the build provides.
+  @app_capabilities %{asn1: "crypto", crypto: "crypto", public_key: "crypto", ssl: "crypto"}
+
+  @boot_name "bin/vm.boot"
+  @runtime_files ~w(beam.emu.mjs beam.wasm)
+  @brotli_block_bits 20
+  @brotli_block_bytes 1024 * 1024
+
+  @patches_dir Path.expand("../../patches", __DIR__)
+
+  # To run, Beam needs following apps:
+  # - kernel
+  # - stdlib (kernel dep)
+  #
+  # We also add elixir support out of the box and need:
+  # - compiler (elixir dep)
+  # - elixir
+  #
+  # All of them should be in elixir's transitive dependency closure
+  @base_apps [:elixir]
+
+  @boot_app :popcorn
+  @boot_functions [mfa: {Popcorn.Boot, :start, 0}, mfa: {Popcorn.Boot, :start, 1}]
+
+  @type options :: [
+          {:root_dir, Path.t()}
+          | {:build_path, Path.t()}
+          | {:out_dir, Path.t()}
+          | {:app, atom() | nil}
+          | {:extra_apps, [atom()]}
+          | {:runtime_variant, String.t() | nil}
+          | {:brotli_effort, :standard | :max}
+          | {:strip, boolean()}
+          | {:exclude_priv, [String.t() | {atom(), String.t()}]}
+          | {:config, keyword()}
+          | {:treeshake, treeshake_options()}
+          | {:static_dir, Path.t()}
+          | {:otp_apps_dir, Path.t()}
+          | {:otp_apps_cache, Path.t()}
+        ]
+
+  @type pack_options :: %{
+          build_path: Path.t(),
+          otp_apps_dir: Path.t(),
+          otp_apps_cache: Path.t(),
+          entrypoint_app: atom() | nil,
+          extra_apps: [atom()],
+          out_dir: Path.t(),
+          runtimes_dir: Path.t(),
+          runtime_variant: String.t() | nil,
+          strip: boolean(),
+          exclude_priv: [String.t() | {atom(), String.t()}],
+          config: keyword(),
+          treeshake: treeshake_options()
+        }
+
+  # True or the options turn tree-shaking on, false off
+  @type treeshake_options :: boolean() | [keep: [Treeshake.keep_entry()]]
+
+  # Native libraries, like NIFs and port drivers, can't be loaded by the Wasm
+  # runtime, which has its NIFs linked in. Dialyzer's PLT files, which some
+  # packages ship, are only read by Dialyzer.
+  @excluded_priv ["**/*.{so,dylib,dll}", "**/*.plt"]
+
+  # Tree-shaking keeps these, as they're only called dynamically: LocalLiveView
+  # views, which it looks up by name, and referenced Ecto schemas, whose
+  # generated functions Ecto calls. Generated functions of modules implementing
+  # behaviours, like LiveComponents, are kept anyway.
+  @kept_always [
+    # Modules below are used by Popcorn for term <-> JS conversion
+    mod: DateTime,
+    mod: Calendar.ISO,
+    mod: MapSet,
+    # Local views are looked up by name (string) and called dynamically
+    behaviour_impls: LocalLiveView,
+    # Ecto schemas
+    referenced_modules_defining: {:__changeset__, 0}
+  ]
+
+  # Tree-shaking removes these unless they're kept: they're reachable, but
+  # only used to compile, evaluate or format code, by a shell or in
+  # distribution.
+  @dropped_by_default [
+    Code.Formatter,
+    :elixir_parser,
+    :elixir_tokenizer,
+    :erl_lint,
+    :erl_eval,
+    :erl_parse,
+    :eval_bits,
+    :prim_inet,
+    :qlc,
+    :qlc_pt,
+    :dets_v9,
+    :dets,
+    :sofs,
+    :erl_tar,
+    :file_sorter,
+    :global,
+    :disk_log,
+    :disk_log_1,
+    :zip,
+    :shell,
+    :edlin_expand,
+    :edlin_type_suggestion,
+    :edlin_context,
+    :dets_utils,
+    :gen_tcp_socket,
+    :socket,
+    :prim_socket,
+    :inet_dns,
+    :net,
+    :rpc,
+    :gen_udp_socket,
+    :dist_util,
+    :dist_ac,
+    :erl_boot_server,
+    :erl_distribution,
+    :erl_epmd,
+    :global_group,
+    :erl_compile,
+    :erl_compile_server,
+    :win32reg
+  ]
+
+  defp beam?(path), do: Path.extname(path) == ".beam"
+
+  # Reimplementation of :beam_lib.strip_files/2.
+  # Original also gzip compresses modules.
+  defp strip_beam({name, content}) do
+    if beam?(to_string(name)) do
+      {:ok, _module, chunks} = :beam_lib.all_chunks(content)
+      chunks_by_name = Map.new(chunks)
+
+      chunks =
+        Enum.flat_map(@retained_chunks, fn name ->
+          case Map.fetch(chunks_by_name, name) do
+            {:ok, data} -> [{name, data}]
+            :error -> []
+          end
+        end)
+
+      {:ok, stripped} = :beam_lib.build_module(chunks)
+
+      {name, stripped}
+    else
+      {name, content}
+    end
+  end
+
+  @spec build(options()) :: {:ok, map()} | {:error, map()}
+  def build(options) do
+    options =
+      Keyword.validate!(options,
+        root_dir: File.cwd!(),
+        build_path: nil,
+        out_dir: "priv/static/popcorn",
+        app: nil,
+        extra_apps: [],
+        runtime_variant: nil,
+        brotli_effort: :standard,
+        strip: true,
+        exclude_priv: [],
+        config: [],
+        treeshake: false,
+        static_dir: Application.app_dir(:popcorn, "priv/static"),
+        otp_apps_dir: Application.app_dir(:popcorn, "priv/otp-apps"),
+        otp_apps_cache: Application.app_dir(:popcorn, "otp-apps")
+      )
+
+    treeshake = validate_treeshake!(options[:treeshake])
+    root_dir = Path.expand(options[:root_dir])
+
+    build_path =
+      Path.expand(options[:build_path] || Path.join(Mix.Project.build_path(), "lib"), root_dir)
+
+    out_dir = options |> Keyword.fetch!(:out_dir) |> Path.expand(root_dir)
+    static_dir = options |> Keyword.fetch!(:static_dir) |> Path.expand(root_dir)
+    otp_apps_dir = options |> Keyword.fetch!(:otp_apps_dir) |> Path.expand(root_dir)
+    otp_apps_cache = options |> Keyword.fetch!(:otp_apps_cache) |> Path.expand(root_dir)
+
+    tmp_dir_name = "popcorn-packager-#{System.pid()}-#{System.unique_integer([:positive])}"
+    packed_dir = Path.join(System.tmp_dir!(), tmp_dir_name)
+
+    File.rm_rf!(out_dir)
+    File.mkdir_p!(out_dir)
+
+    result =
+      try do
+        with {:ok, report} <-
+               pack(%{
+                 build_path: build_path,
+                 otp_apps_dir: otp_apps_dir,
+                 otp_apps_cache: otp_apps_cache,
+                 entrypoint_app: options[:app],
+                 extra_apps: options[:extra_apps],
+                 out_dir: packed_dir,
+                 runtimes_dir: Path.join(static_dir, "runtimes"),
+                 runtime_variant: options[:runtime_variant],
+                 strip: options[:strip],
+                 exclude_priv: options[:exclude_priv],
+                 config: options[:config],
+                 treeshake: treeshake
+               }),
+             {:ok, installed} <-
+               install_output(report, static_dir, out_dir, options[:brotli_effort]) do
+          {:ok, installed}
+        end
+      after
+        File.rm_rf!(packed_dir)
+      end
+
+    case result do
+      {:ok, _report} = ok ->
+        ok
+
+      {:error, _reason} = error ->
+        File.rm_rf!(out_dir)
+        error
+    end
+  end
+
+  @spec pack(pack_options()) :: {:ok, map()} | {:error, map()}
+  defp pack(args) do
+    %{
+      build_path: build_path,
+      otp_apps_dir: otp_apps_dir,
+      otp_apps_cache: otp_apps_cache,
+      entrypoint_app: entrypoint_app,
+      extra_apps: extra_apps,
+      out_dir: out_dir,
+      runtimes_dir: runtimes_dir,
+      runtime_variant: runtime_variant,
+      strip: strip,
+      exclude_priv: exclude_priv,
+      config: config,
+      treeshake: treeshake
+    } = args
+
+    toolchain = fetch_toolchain_info()
+    staging_dir = Path.join(out_dir, "staging")
+
+    with {:ok, otp_apps} <- compile_otp_apps(otp_apps_dir, otp_apps_cache, toolchain),
+         {:ok, project_apps} <- get_apps_info(build_path),
+         {:ok, builtin_apps} <- get_builtin_apps(toolchain, otp_apps.dir),
+         {:ok, apps_info} <- apps_to_pack(project_apps, builtin_apps, extra_apps, entrypoint_app),
+         app_bundles = group_apps(apps_info, project_apps, entrypoint_app),
+         variant = runtime_variant || required_runtime(apps_info),
+         {:ok, manifest} <- read_manifest(Path.join([runtimes_dir, variant, "manifest.json"])),
+         :ok <- check_runtime_otp(otp_apps.otp_version, manifest.version),
+         :ok <- check_otp_apps_crypto(otp_apps.apps, manifest.capabilities),
+         :ok <- check_capabilities(apps_info, manifest.capabilities),
+         staged_apps = stage_apps(staging_dir, apps_info),
+         remove_priv_files(staged_apps, @excluded_priv ++ exclude_priv),
+         :ok <- patch_apps(staged_apps),
+         staged_apps =
+           staged_apps |> remove_build_tools() |> add_config(config) |> configure_kernel(),
+         {:ok, staged_apps, treeshake_report} <-
+           maybe_treeshake(staged_apps, treeshake, out_dir),
+         {:ok, boot_path} <- create_boot(out_dir, staged_apps) do
+      vm_version = manifest.version
+      toolchain = Map.take(toolchain, ~w(otp elixir)a)
+
+      File.mkdir_p!(out_dir)
+
+      packed_apps =
+        Map.new(staged_apps, fn {app, info} ->
+          version = Keyword.get(info.props, :vsn, ~c"") |> to_string()
+          {app, %{bundle: Map.fetch!(app_bundles, app), version: version}}
+        end)
+
+      diagnostics =
+        staged_apps
+        |> Map.drop(otp_apps.apps)
+        |> async_stream(fn {app, info} ->
+          case loaded_dynamic_nifs(info.ebin_dir) do
+            [] ->
+              []
+
+            beams ->
+              {:error, context} = err(:dynamic_nifs_loading, {app, beams})
+              [context]
+          end
+        end)
+        |> Enum.concat()
+
+      manifest_path = Path.join(out_dir, "manifest.json")
+
+      bundles =
+        Map.new(~w(stdlib app deps), fn group ->
+          in_group? = fn {app, _info} -> app_bundles[app] == group end
+          apps = Enum.filter(staged_apps, in_group?)
+          extra_files = if group == "app", do: [{@boot_name, boot_path}], else: []
+          {group, %{tar: create_tarball(out_dir, group, apps, extra_files, strip)}}
+        end)
+
+      tar_paths =
+        Enum.map(~w(stdlib app deps), &Path.join(out_dir, Map.fetch!(bundles, &1).tar))
+
+      manifest = %{
+        entrypoint: entrypoint_app,
+        runtimeVariant: variant,
+        apps: packed_apps,
+        bundles: bundles,
+        notes: diagnostics,
+        toolchain: toolchain,
+        vm: %{version: vm_version}
+      }
+
+      File.write!(manifest_path, JSON.encode!(manifest))
+
+      result = %{
+        ok: true,
+        runtimeVariant: variant,
+        entrypoint: entrypoint_app,
+        manifestPath: Path.expand(manifest_path),
+        tarPaths: tar_paths,
+        apps: packed_apps,
+        bundles: bundles,
+        notes: diagnostics,
+        toolchain: toolchain,
+        treeshake: treeshake_report
+      }
+
+      {:ok, result}
+    end
+  end
+
+  defp install_output(report, static_dir, out_dir, brotli_effort) do
+    variant_dir = Path.join([static_dir, "runtimes", report.runtimeVariant])
+
+    js_files = Enum.map(~w(index.mjs worker.mjs), &{&1, Path.join(static_dir, &1)})
+    vm_files = Enum.map(@runtime_files, &{&1, Path.join(variant_dir, &1)})
+
+    with :ok <- copy_assets(js_files ++ vm_files, out_dir) do
+      for {filename, _source} <- js_files ++ vm_files do
+        compress(Path.join(out_dir, filename), brotli_effort)
+      end
+
+      manifest_path = Path.join(out_dir, "otp/manifest.json")
+      lib_dir = Path.join(out_dir, "otp/lib")
+
+      File.mkdir_p!(Path.dirname(manifest_path))
+      File.mkdir_p!(lib_dir)
+      File.cp!(report.manifestPath, manifest_path)
+
+      tar_paths =
+        Enum.map(report.tarPaths, fn source ->
+          target = Path.join(lib_dir, Path.basename(source))
+          File.cp!(source, target)
+          compress(target, brotli_effort)
+          Path.expand(target)
+        end)
+
+      {:ok,
+       %{
+         report
+         | manifestPath: Path.expand(manifest_path),
+           tarPaths: tar_paths
+       }}
+    end
+  end
+
+  defp copy_assets(files, out_dir) do
+    outdir_cp = fn {filename, source}, _ ->
+      case File.cp(source, Path.join(out_dir, filename)) do
+        :ok -> :ok
+        {:error, reason} -> err(:missing_runtime_resource, {source, reason})
+      end
+    end
+
+    case reduce_while_ok(files, :ok, outdir_cp) do
+      {:ok, _} -> :ok
+      {:error, _reason} = error -> error
+    end
+  end
+
+  # Local patch (see vendor/popcorn/VENDORED.md): compressed outputs are cached
+  # by content hash, so a rebuild only recompresses the files that changed
+  # (usually just the app bundle). Brotli on the runtime, stdlib and deps is
+  # most of an untreeshaken cook.
+  defp compress(path, brotli_effort) do
+    contents = File.read!(path)
+
+    key =
+      :crypto.hash(:sha256, [contents, to_string(brotli_effort)]) |> Base.encode16(case: :lower)
+
+    cached = Path.join(compress_cache_dir(), key)
+
+    if File.regular?(cached <> ".gz") and File.regular?(cached <> ".br") do
+      File.cp!(cached <> ".gz", path <> ".gz")
+      File.cp!(cached <> ".br", path <> ".br")
+    else
+      do_compress(path, contents, brotli_effort)
+      File.mkdir_p!(Path.dirname(cached))
+      # .br last: its presence marks a complete entry.
+      File.cp!(path <> ".gz", cached <> ".gz")
+      File.cp!(path <> ".br", cached <> ".br")
+    end
+  end
+
+  # shortcut: never evicted; every app-bundle change adds ~120KB. Delete the
+  # directory to reset it.
+  defp compress_cache_dir, do: Path.join(Mix.Project.build_path(), "popcorn_compress_cache")
+
+  defp do_compress(path, contents, brotli_effort) do
+    File.write!(path <> ".gz", :zlib.gzip(contents))
+
+    # The Brotli NIF drops unconsumed input when a call crosses a block boundary.
+    encoder =
+      :brotli_encoder.new(%{
+        quality: brotli_quality(brotli_effort),
+        block_size: @brotli_block_bits,
+        size_hint: byte_size(contents)
+      })
+
+    compressed = compress_brotli(encoder, contents, [])
+    true = :brotli_encoder.is_finished(encoder)
+    File.write!(path <> ".br", compressed)
+  end
+
+  defp compress_brotli(encoder, <<block::binary-size(@brotli_block_bytes), rest::binary>>, acc) do
+    {:ok, output} = :brotli_encoder.append(encoder, block)
+    compress_brotli(encoder, rest, [output | acc])
+  end
+
+  defp compress_brotli(encoder, rest, acc) do
+    {:ok, output} = :brotli_encoder.finish(encoder, rest)
+    Enum.reverse([output | acc])
+  end
+
+  defp brotli_quality(:standard), do: 9
+  defp brotli_quality(:max), do: 11
+
+  defp create_boot(out_dir, staged_apps) do
+    boot_path = Path.join(out_dir, @boot_name)
+    rel_path = Path.join(out_dir, Path.basename(@boot_name, ".boot"))
+
+    for {app, info} <- staged_apps do
+      File.write!(app_file(app, info), consultable({:application, app, info.props}))
+    end
+
+    apps =
+      for {app, info} <- Enum.sort(staged_apps) do
+        vsn = Keyword.fetch!(info.props, :vsn)
+        if app in [:kernel, :stdlib], do: {app, vsn}, else: {app, vsn, :load}
+      end
+
+    release = {:release, {~c"popcorn", ~c"1"}, {:erts, :erlang.system_info(:version)}, apps}
+    File.write!(rel_path <> ".rel", consultable(release))
+    File.mkdir_p!(Path.dirname(boot_path))
+
+    options = [
+      :silent,
+      :no_dot_erlang,
+      :no_warn_sasl,
+      path: Enum.map(staged_apps, fn {_app, info} -> to_charlist(info.ebin_dir) end),
+      outdir: to_charlist(Path.dirname(boot_path))
+    ]
+
+    with {:ok, _module, _warnings} <- :systools.make_script(to_charlist(rel_path), options) do
+      {:script, id, commands} = boot_path |> File.read!() |> :erlang.binary_to_term()
+      packaged = packaged_modules(staged_apps)
+
+      commands =
+        commands
+        # preLoaded is unused during runtime
+        |> Enum.reject(&match?({:preLoaded, _modules}, &1))
+        |> Enum.map(&(&1 |> drop_app_versions() |> drop_unpackaged(packaged)))
+
+      File.write!(boot_path, :erlang.term_to_binary({:script, id, commands}))
+      {:ok, boot_path}
+    else
+      {:error, module, reason} -> err(:boot_script_failed, module.format_error(reason))
+    end
+  end
+
+  defp drop_unpackaged({:primLoad, modules}, packaged),
+    do: {:primLoad, Enum.filter(modules, &MapSet.member?(packaged, &1))}
+
+  defp drop_unpackaged(command, _packaged), do: command
+
+  defp add_config(staged_apps, config) do
+    config
+    |> Keyword.delete(:popcorn)
+    |> Keyword.take(Map.keys(staged_apps))
+    |> Enum.reduce(staged_apps, fn {app, app_config}, apps ->
+      update_in(apps[app].props[:env], &Keyword.merge(&1 || [], app_config))
+    end)
+  end
+
+  # The runtime has no distribution. It's configured in kernel's spec, as the
+  # `-kernel start_distribution false` arguments would need the Erlang parser.
+  defp configure_kernel(staged_apps) do
+    update_in(staged_apps[:kernel].props, fn props ->
+      env = props |> Keyword.get(:env, []) |> Keyword.put(:start_distribution, false)
+      Keyword.put(props, :env, env)
+    end)
+  end
+
+  # `$ROOT/lib/kernel-10.5/ebin` -> `$ROOT/lib/kernel/ebin`
+  defp drop_app_versions({:path, dirs}) do
+    {:path, Enum.map(dirs, &drop_version_fragment/1)}
+  end
+
+  defp drop_app_versions(command), do: command
+
+  defp drop_version_fragment(dir) do
+    [root, "lib", app_version, "ebin"] = dir |> to_string() |> Path.split()
+    [app, _version] = String.split(app_version, "-", parts: 2)
+
+    to_charlist(Path.join([root, "lib", app, "ebin"]))
+  end
+
+  # Apps are copied out of the host installation so packing can modify them.
+  defp stage_apps(staging_dir, apps_info) do
+    apps_info
+    |> async_stream(fn {app, info} ->
+      app_dir = Path.join(staging_dir, "#{app}")
+      ebin_dir = Path.join(app_dir, "ebin")
+      priv_dir = Path.join(Path.dirname(info.ebin_dir), "priv")
+
+      File.mkdir_p!(app_dir)
+      copy_writable!(info.ebin_dir, ebin_dir)
+
+      if File.dir?(priv_dir) do
+        copy_writable!(priv_dir, Path.join(app_dir, "priv"))
+      end
+
+      {app, %{info | ebin_dir: ebin_dir}}
+    end)
+    |> Map.new()
+  end
+
+  defp copy_writable!(source, destination) do
+    source
+    |> File.cp_r!(destination, dereference_symlinks: true)
+    |> Enum.each(fn path ->
+      %File.Stat{type: type, mode: mode} = File.stat!(path)
+
+      if type == :regular and Bitwise.band(mode, 0o200) == 0 do
+        File.chmod!(path, Bitwise.bor(mode, 0o200))
+      end
+    end)
+  end
+
+  defp remove_priv_files(staged_apps, patterns) do
+    {app_patterns, shared_patterns} = Enum.split_with(patterns, &is_tuple/1)
+    app_patterns = Enum.group_by(app_patterns, &elem(&1, 0), &elem(&1, 1))
+    unknown_apps = Map.keys(app_patterns) -- Map.keys(staged_apps)
+
+    if unknown_apps != [] do
+      apps = Enum.join(unknown_apps, ", ")
+      warn("exclude_priv names applications that aren't packaged: #{apps}")
+    end
+
+    for {app, info} <- staged_apps,
+        priv_dir = Path.join(Path.dirname(info.ebin_dir), "priv"),
+        pattern <- shared_patterns ++ Map.get(app_patterns, app, []),
+        path <- Path.wildcard(Path.join(priv_dir, pattern), match_dot: true) do
+      File.rm_rf!(path)
+      remove_if_empty(Path.dirname(path), priv_dir)
+    end
+  end
+
+  defp remove_if_empty(dir, priv_dir) do
+    if File.rmdir(dir) == :ok and dir != priv_dir do
+      remove_if_empty(Path.dirname(dir), priv_dir)
+    end
+  end
+
+  # we patch only selected modules from OTP, see patches/
+  defp patch_apps(staged_apps) do
+    [@patches_dir, "*", "*.erl"]
+    |> Path.join()
+    |> Path.wildcard()
+    |> reduce_while_ok(:ok, fn patch_path, :ok ->
+      app = patch_path |> Path.dirname() |> Path.basename() |> String.to_existing_atom()
+      name = Path.basename(patch_path, ".erl") <> ".beam"
+      ebin_dir = Map.fetch!(staged_apps, app).ebin_dir
+      beam_path = Path.join(ebin_dir, name)
+
+      BeamPatcher.patch_beam(beam_path, patch_path)
+    end)
+    |> case do
+      {:ok, _} -> :ok
+      {:error, _} = error -> error
+    end
+  end
+
+  defp remove_build_tools(staged_apps) do
+    case Map.fetch(staged_apps, :popcorn) do
+      :error ->
+        staged_apps
+
+      {:ok, info} ->
+        {build_tools, runtime_modules} =
+          info.props
+          |> Keyword.fetch!(:modules)
+          |> Enum.split_with(&build_tool?/1)
+
+        Enum.each(build_tools, fn module ->
+          File.rm!(Path.join(info.ebin_dir, "#{module}.beam"))
+        end)
+
+        for dir <- ["priv/static", "priv/otp-apps"] do
+          File.rm_rf!(Path.join(Path.dirname(info.ebin_dir), dir))
+        end
+
+        replace_app_modules(staged_apps, %{popcorn: runtime_modules})
+    end
+  end
+
+  defp build_tool?(module) do
+    name = Atom.to_string(module)
+
+    String.starts_with?(name <> ".", [
+      "Elixir.Popcorn.Packager.",
+      "Elixir.Treeshake.",
+      "treeshake_helper.",
+      "Elixir.Mix.Tasks.Popcorn."
+    ])
+  end
+
+  defp async_stream(enumerable, fun) do
+    enumerable
+    |> Task.async_stream(fun, timeout: :infinity)
+    |> Enum.map(fn {:ok, result} -> result end)
+  end
+
+  defp get_apps_info(root_dir) do
+    extract_info = fn app_path ->
+      {:ok, [{:application, name, props}]} = :file.consult(app_path)
+      dir = Path.dirname(app_path)
+
+      {name, %{props: props, ebin_dir: dir, app_path: app_path}}
+    end
+
+    get_name = fn {name, _info} -> name end
+    get_app_path = fn {_name, info} -> info.app_path end
+    duplicated? = fn {_name, paths} -> match?([_, _ | _], paths) end
+
+    # Mix dependencies can use app: false and expose no .app; packaging currently
+    # includes only OTP applications.
+    apps =
+      root_dir
+      |> Path.join("*/ebin/*.app")
+      |> Path.wildcard()
+      |> Enum.map(extract_info)
+
+    duplicates =
+      apps
+      |> Enum.group_by(get_name, get_app_path)
+      |> Enum.filter(duplicated?)
+      |> Map.new()
+
+    if Enum.empty?(duplicates) do
+      {:ok, Map.new(apps)}
+    else
+      err(:duplicated_apps, {root_dir, duplicates})
+    end
+  end
+
+  defp get_builtin_apps(toolchain, otp_apps_dir) do
+    with {:ok, elixir_apps} <- get_apps_info(toolchain.elixir_root),
+         {:ok, host_otp_apps} <- get_apps_info(toolchain.otp_root),
+         {:ok, otp_apps} <- get_apps_info(otp_apps_dir) do
+      {:ok, elixir_apps |> Map.merge(host_otp_apps) |> Map.merge(otp_apps)}
+    end
+  end
+
+  defp read_manifest(manifest_path) do
+    with {:ok, json} <- File.read(manifest_path),
+         {:ok, %{"vm" => vm}} <- JSON.decode(json),
+         %{"version" => version, "capabilities" => capabilities} <- vm do
+      {:ok, %{version: version, capabilities: capabilities}}
+    else
+      _ -> err(:bad_manifest, manifest_path)
+    end
+  end
+
+  defp apps_to_pack(project_apps, builtin_apps, extra_apps, entrypoint) do
+    all_apps_info = Map.merge(builtin_apps, project_apps)
+
+    gather_from_root = fn app, selected ->
+      gather_required_apps(all_apps_info, project_apps, app, selected)
+    end
+
+    with {:ok, roots} <- root_apps(all_apps_info, extra_apps, entrypoint),
+         {:ok, selected_apps} <-
+           reduce_while_ok(Map.keys(project_apps) ++ roots, MapSet.new(), gather_from_root) do
+      all_apps_info
+      |> Map.filter(fn {app, _info} -> MapSet.member?(selected_apps, app) end)
+      |> Enum.sort()
+      |> then(&{:ok, &1})
+    end
+  end
+
+  defp required_runtime(apps_info) do
+    needs_crypto = Enum.any?(apps_info, fn {app, _info} -> @app_capabilities[app] == "crypto" end)
+    if needs_crypto, do: "crypto", else: "core"
+  end
+
+  defp check_capabilities(apps_info, capabilities) do
+    unsupported =
+      apps_info
+      |> Enum.flat_map(fn {app, _info} ->
+        case Map.fetch(@app_capabilities, app) do
+          {:ok, capability} -> [%{app: app, capability: capability}]
+          :error -> []
+        end
+      end)
+      |> Enum.reject(&Map.fetch!(capabilities, &1.capability))
+
+    if unsupported == [], do: :ok, else: err(:unsupported_apps, unsupported)
+  end
+
+  defp validate_treeshake!(enable) when is_boolean(enable), do: enable
+
+  defp validate_treeshake!(options) do
+    if Keyword.keyword?(options) do
+      Keyword.validate!(options, keep: [])
+    else
+      raise ArgumentError,
+            "expected the treeshake option to be true, false or a keyword list of options, " <>
+              "got: #{inspect(options)}"
+    end
+  end
+
+  defp maybe_treeshake(staged_apps, false, _out_dir), do: {:ok, staged_apps, nil}
+  defp maybe_treeshake(staged_apps, true, out_dir), do: treeshake(staged_apps, [], out_dir)
+
+  defp maybe_treeshake(staged_apps, options, out_dir),
+    do: treeshake(staged_apps, options[:keep], out_dir)
+
+  defp treeshake(staged_apps, keep, out_dir) do
+    warn_unknown_kept(staged_apps, keep)
+    drop = dropped_modules(keep)
+
+    with {:ok, stats} <- run_treeshake(staged_apps, keep, drop, out_dir) do
+      staged_apps = replace_beams(staged_apps, stats.output_dir)
+
+      report = %{
+        modules_removed: Enum.map(stats.modules_removed, &to_string/1),
+        modules_shaken:
+          stats.modules_shaked |> Map.keys() |> Enum.map(&to_string/1) |> Enum.sort()
+      }
+
+      {:ok, staged_apps, report}
+    end
+  end
+
+  defp packaged_modules(staged_apps) do
+    staged_apps
+    |> Enum.flat_map(fn {_app, info} -> Keyword.fetch!(info.props, :modules) end)
+    |> MapSet.new()
+  end
+
+  defp dropped_modules(keep) do
+    for module <- @dropped_by_default -- kept_modules(keep), do: {:mod, module}
+  end
+
+  defp kept_modules(keep) do
+    Enum.flat_map(keep, fn
+      {:mod, module} -> [module]
+      {:mfa, {module, _fun, _arity}} -> [module]
+      _entry -> []
+    end)
+  end
+
+  defp warn_unknown_kept(staged_apps, keep) do
+    packaged = packaged_modules(staged_apps)
+
+    unknown =
+      keep
+      |> kept_modules()
+      |> Enum.reject(&MapSet.member?(packaged, &1))
+      |> Enum.uniq()
+      |> Enum.sort()
+
+    if unknown != [] do
+      warn("keep names modules that aren't packaged: #{Enum.map_join(unknown, ", ", &inspect/1)}")
+    end
+  end
+
+  defp run_treeshake(staged_apps, keep, drop, out_dir) do
+    files =
+      Enum.flat_map(staged_apps, fn {_app, info} ->
+        info.ebin_dir |> Path.join("*") |> Path.wildcard()
+      end)
+
+    output_dir = Path.join(out_dir, "treeshaken")
+
+    report =
+      Treeshake.run(
+        ebin_files: files,
+        output_dir: output_dir,
+        keep: @boot_functions ++ @kept_always ++ keep,
+        drop: drop
+      )
+
+    {:ok, report}
+  rescue
+    error -> err(:treeshake_failed, Exception.message(error))
+  end
+
+  defp replace_beams(staged_apps, output_dir) do
+    Map.new(staged_apps, fn {app, info} ->
+      replacement_dir = info.ebin_dir <> ".replacement"
+      File.cp_r!(info.ebin_dir, replacement_dir)
+
+      replacement_beams = replacement_dir |> Path.join("*.beam") |> Path.wildcard()
+      Enum.each(replacement_beams, &File.rm!/1)
+
+      surviving =
+        Enum.flat_map(replacement_beams, fn replacement ->
+          source = Path.join(output_dir, Path.basename(replacement))
+          target = Path.join(replacement_dir, Path.basename(replacement))
+
+          case File.cp(source, target) do
+            :ok -> [source |> Path.basename(".beam") |> String.to_atom()]
+            {:error, :enoent} -> []
+          end
+        end)
+
+      replace_directory(info.ebin_dir, replacement_dir)
+      {app, put_in(info.props[:modules], Enum.sort(surviving))}
+    end)
+  end
+
+  defp replace_directory(path, replacement) do
+    original = path <> ".original"
+    File.rename!(path, original)
+
+    try do
+      File.rename!(replacement, path)
+    rescue
+      error ->
+        File.rename!(original, path)
+        reraise error, __STACKTRACE__
+    end
+
+    File.rm_rf!(original)
+  end
+
+  defp replace_app_modules(staged_apps, app_modules) do
+    Enum.reduce(app_modules, staged_apps, fn {app, modules}, apps ->
+      put_in(apps[app].props[:modules], modules)
+    end)
+  end
+
+  defp app_file(app, info), do: Path.join(info.ebin_dir, "#{app}.app")
+
+  # Saves a term in a format readable by file:consult/1
+  defp consultable(term) do
+    IO.chardata_to_string(:io_lib.format(~c"~tp.~n", [term]))
+  end
+
+  defp root_apps(all_apps_info, extra_apps, entrypoint) do
+    with {:ok, roots} <- entrypoint_roots(all_apps_info, entrypoint),
+         {:ok, extra} <- extra_roots(all_apps_info, extra_apps) do
+      {:ok, extra ++ roots}
+    end
+  end
+
+  defp entrypoint_roots(all_apps_info, _entrypoint)
+       when not is_map_key(all_apps_info, @boot_app),
+       do: err(:missing_boot_app, @boot_app)
+
+  defp entrypoint_roots(_all_apps_info, nil), do: {:ok, [@boot_app | @base_apps]}
+
+  # The entrypoint may be a builtin app, so a project with no code of its own
+  # doesn't need a stub application just to depend on one.
+  defp entrypoint_roots(all_apps_info, entrypoint)
+       when is_map_key(all_apps_info, entrypoint),
+       do: {:ok, [entrypoint, @boot_app | @base_apps]}
+
+  defp entrypoint_roots(_all_apps_info, entrypoint),
+    do: err(:missing_entrypoint, entrypoint)
+
+  defp extra_roots(all_apps_info, extra_apps) do
+    case Enum.reject(extra_apps, &is_map_key(all_apps_info, &1)) do
+      [] -> {:ok, extra_apps}
+      missing -> err(:missing_extra_apps, Enum.sort(missing))
+    end
+  end
+
+  defp gather_required_apps(all_apps_info, project_apps, app, selected) do
+    if MapSet.member?(selected, app) do
+      {:ok, selected}
+    else
+      info = Map.fetch!(all_apps_info, app)
+      selected = MapSet.put(selected, app)
+
+      info.props
+      |> get_required_apps()
+      |> reduce_while_ok(selected, fn dep, acc ->
+        if Map.has_key?(all_apps_info, dep) do
+          gather_required_apps(all_apps_info, project_apps, dep, acc)
+        else
+          project_app_names = Enum.sort(Map.keys(project_apps))
+          err(:missing_dep, {app, dep, project_app_names})
+        end
+      end)
+    end
+  end
+
+  defp reduce_while_ok(enumerable, acc, f) do
+    Enum.reduce_while(enumerable, {:ok, acc}, fn value, {:ok, acc} ->
+      case f.(value, acc) do
+        :ok -> {:cont, {:ok, acc}}
+        {:ok, new_acc} -> {:cont, {:ok, new_acc}}
+        {:error, _} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp group_apps(apps_info, project_apps, entrypoint) do
+    Map.new(apps_info, fn {app, _info} ->
+      group =
+        case project_apps do
+          %{^app => _} when app == entrypoint -> "app"
+          %{^app => _} -> "deps"
+          _ -> "stdlib"
+        end
+
+      {app, group}
+    end)
+  end
+
+  defp create_tarball(outdir, group, apps, extra_files, strip) do
+    path = Path.join(outdir, "lib/#{group}.tar")
+
+    app_entries =
+      for {app, info} <- Enum.sort(apps),
+          app_dir = Path.dirname(info.ebin_dir),
+          file <- Path.wildcard(Path.join(app_dir, "**"), match_dot: true),
+          File.regular?(file) and file != app_file(app, info) do
+        entry =
+          {to_charlist(Path.join(["lib", "#{app}", Path.relative_to(file, app_dir)])),
+           File.read!(file)}
+
+        if strip, do: strip_beam(entry), else: entry
+      end
+
+    entries =
+      app_entries ++
+        for({name, source} <- extra_files, do: {to_charlist(name), File.read!(source)})
+
+    File.mkdir_p!(Path.dirname(path))
+    opts = [mtime: 0, atime: 0, ctime: 0, uid: 0, gid: 0]
+    :ok = :erl_tar.create(to_charlist(path), entries, opts)
+
+    Path.join("lib", Path.basename(fingerprint(path)))
+  end
+
+  defp fingerprint(path) do
+    hash = :crypto.hash(:sha256, File.read!(path)) |> Base.encode16(case: :lower)
+    target = Path.rootname(path) <> ".#{hash}" <> Path.extname(path)
+    File.rename!(path, target)
+    target
+  end
+
+  defp loaded_dynamic_nifs(ebin_dir) do
+    Path.join(ebin_dir, "*.beam")
+    |> Path.wildcard()
+    |> Enum.filter(&imports_load_nif?/1)
+    |> Enum.map(&Path.basename/1)
+  end
+
+  defp imports_load_nif?(beam_path) do
+    case :beam_lib.chunks(to_charlist(beam_path), [:imports]) do
+      {:ok, {_mod, [imports: imports]}} -> {:erlang, :load_nif, 2} in imports
+      _ -> false
+    end
+  end
+
+  defp fetch_toolchain_info() do
+    %{
+      otp: host_otp_version(),
+      elixir: System.version(),
+      otp_root: Path.join(to_string(:code.root_dir()), "lib"),
+      elixir_root: :elixir |> :code.lib_dir() |> to_string() |> Path.dirname()
+    }
+  end
+
+  # The host compiles them, so it must be on their major OTP version
+  defp compile_otp_apps(export_dir, cache_dir, toolchain) do
+    case OtpApps.compile(export_dir, cache_dir) do
+      {:ok, otp_apps} -> {:ok, otp_apps}
+      {:error, :missing} -> err(:missing_otp_apps, export_dir)
+      {:error, {:unsupported_otp, version}} -> err(:unsupported_otp, {toolchain.otp, version})
+      {:error, {:compile_failed, modules}} -> err(:otp_compile_failed, modules)
+    end
+  end
+
+  # The runtime and the OTP applications are built together
+  defp check_runtime_otp(otp_apps_version, runtime_version) do
+    if otp_apps_version == runtime_version do
+      :ok
+    else
+      err(:mismatched_otp_apps, {otp_apps_version, runtime_version})
+    end
+  end
+
+  # The crypto runtime's NIFs are bound by Popcorn's crypto, which a runtime
+  # build without crypto doesn't export. The host's can't take its place.
+  defp check_otp_apps_crypto(otp_apps, capabilities) do
+    if capabilities["crypto"] and :crypto not in otp_apps,
+      do: err(:otp_apps_without_crypto, otp_apps),
+      else: :ok
+  end
+
+  defp warn(msg) do
+    IO.puts(:stderr, IO.ANSI.format([:yellow, msg]))
+  end
+
+  defp host_otp_version do
+    path =
+      Path.join([to_string(:code.root_dir()), "releases", System.otp_release(), "OTP_VERSION"])
+
+    path
+    |> File.read!()
+    |> String.trim()
+  end
+
+  defp otp_major(version) do
+    {major, _rest} = version |> to_string() |> Integer.parse()
+    major
+  end
+
+  defp get_required_apps(props) do
+    prop = &Keyword.get/3
+    optional = prop.(props, :optional_applications, []) |> MapSet.new()
+    applications = prop.(props, :applications, []) |> MapSet.new()
+    included = prop.(props, :included_applications, []) |> MapSet.new()
+
+    MapSet.union(applications, included)
+    |> MapSet.difference(optional)
+    |> MapSet.to_list()
+  end
+
+  @spec format_error(map()) :: String.t()
+  def format_error(%{code: "missing_dep"} = error) do
+    "#{error.app} depends on #{error.dep}, which is not available. " <>
+      "Project applications: #{Enum.join(error.available_apps, ", ")}."
+  end
+
+  def format_error(%{code: "unsupported_apps", apps: apps}) do
+    apps = Enum.map_join(apps, ", ", &"#{&1.app} (requires #{&1.capability})")
+    "The WASM runtime lacks native support required by: #{apps}."
+  end
+
+  def format_error(%{code: "missing_extra_apps", apps: apps}) do
+    "Extra applications not found: #{Enum.join(apps, ", ")}."
+  end
+
+  def format_error(%{code: "missing_boot_app", app: app}) do
+    "Booting requires the #{app} application, which is not available."
+  end
+
+  def format_error(%{code: "boot_script_failed", message: message}) do
+    "Making the boot script failed: #{message}"
+  end
+
+  def format_error(%{code: "unsupported_otp", host: host, runtime: runtime}) do
+    "Packaging requires OTP #{otp_major(runtime)} on the host, because Popcorn runs on " <>
+      "OTP #{runtime}. The installed OTP is #{host}."
+  end
+
+  def format_error(%{code: "missing_otp_apps", path: path}) do
+    "Popcorn's OTP applications aren't in #{path}. Build Popcorn's runtime first, " <>
+      "which exports them."
+  end
+
+  def format_error(%{code: "mismatched_otp_apps", otp_apps: otp_apps, runtime: runtime}) do
+    "Popcorn's OTP applications are from OTP #{otp_apps}, but its runtime is OTP #{runtime}. " <>
+      "Build them together."
+  end
+
+  def format_error(%{code: "otp_apps_without_crypto"}) do
+    "Popcorn's OTP applications come from a runtime build without crypto, but its crypto " <>
+      "runtime is used. Build the runtime with crypto."
+  end
+
+  def format_error(%{code: "otp_compile_failed", modules: modules}) do
+    "Compiling Popcorn's OTP applications failed: #{Enum.join(modules, ", ")}."
+  end
+
+  def format_error(%{code: "treeshake_failed", message: message}), do: message
+
+  def format_error(%{code: "missing_runtime_resource", path: path}) do
+    "Runtime resource not found: #{path}. Build the Popcorn JavaScript artifacts first."
+  end
+
+  def format_error(error), do: "Packaging failed: #{inspect(error)}"
+
+  defp err(:missing_entrypoint, app) do
+    {:error, %{code: "missing_entrypoint", app: app}}
+  end
+
+  defp err(:missing_extra_apps, apps) do
+    {:error, %{code: "missing_extra_apps", apps: apps}}
+  end
+
+  defp err(:bad_manifest, path) do
+    {:error, %{code: "bad_manifest", path: path}}
+  end
+
+  defp err(:unsupported_otp, {host, runtime}) do
+    {:error, %{code: "unsupported_otp", host: host, runtime: runtime}}
+  end
+
+  defp err(:mismatched_otp_apps, {otp_apps, runtime}) do
+    {:error, %{code: "mismatched_otp_apps", otp_apps: otp_apps, runtime: runtime}}
+  end
+
+  defp err(:duplicated_apps, {root_dir, duplicates}) do
+    {:error, %{code: "duplicated_apps", root_dir: root_dir, duplicates: duplicates}}
+  end
+
+  defp err(:unsupported_apps, unsupported) do
+    {:error, %{code: "unsupported_apps", apps: Enum.sort_by(unsupported, & &1.app)}}
+  end
+
+  defp err(:missing_dep, {app, dep, project_apps}) do
+    {:error, %{code: "missing_dep", app: app, dep: dep, available_apps: project_apps}}
+  end
+
+  defp err(:dynamic_nifs_loading, {app, beams}) do
+    {:error, %{code: "dynamic_nifs_loading", app: app, beams: beams}}
+  end
+
+  defp err(:missing_boot_app, app) do
+    {:error, %{code: "missing_boot_app", app: app}}
+  end
+
+  defp err(:boot_script_failed, message) do
+    {:error, %{code: "boot_script_failed", message: to_string(message)}}
+  end
+
+  defp err(:treeshake_failed, message) do
+    {:error, %{code: "treeshake_failed", message: message}}
+  end
+
+  defp err(:missing_otp_apps, path) do
+    {:error, %{code: "missing_otp_apps", path: path}}
+  end
+
+  defp err(:otp_apps_without_crypto, otp_apps) do
+    {:error, %{code: "otp_apps_without_crypto", otp_apps: otp_apps}}
+  end
+
+  defp err(:otp_compile_failed, modules) do
+    {:error, %{code: "otp_compile_failed", modules: modules}}
+  end
+
+  defp err(:missing_runtime_resource, {path, reason}) do
+    {:error, %{code: "missing_runtime_resource", path: path, reason: to_string(reason)}}
+  end
+end

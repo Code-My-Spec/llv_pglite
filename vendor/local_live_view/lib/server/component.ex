@@ -1,0 +1,261 @@
+defmodule LocalLiveView.Component do
+  @moduledoc """
+  Phoenix component for mounting a `LocalLiveView`.
+
+  Import this module in your application's CoreComponents:
+
+      defmodule MyAppWeb.CoreComponents do
+        import LocalLiveView.Component
+        ...
+      end
+
+  Then use it in your templates:
+
+      <.local_live_view view="MyLive" />
+      <.local_live_view view="Cart" items={@items} />
+  """
+  use Phoenix.Component
+
+  require Logger
+
+  @doc ~S'''
+  Renders a `LocalLiveView` mount point.
+
+  Like `Phoenix.Component.live_component/1`, any attribute other than the ones
+  listed below is forwarded to the view as the assigns of its
+  `c:LocalLiveView.update/2` callback. `id` is forwarded too, and additionally
+  used as the view's DOM id.
+
+  ## Attributes
+
+    * `view` (required) - the LocalLiveView module name, as a string.
+    * `id` - stable element id; defaults to a server-generated random id.
+    * `llv_ssr` - whether to render the view on the server, defaults to `true`.
+      See the "Server-side rendering" section in the `LocalLiveView` module doc.
+
+  ## Examples
+
+      <.local_live_view view="MyLocal" />
+
+      <.local_live_view view="Cart" items={@items} currency="EUR" />
+
+  The second example mounts the view, calling its `update/2` with:
+
+      %{id: _, items: items, currency: "EUR"}
+  '''
+  def local_live_view(assigns) do
+    view = assigns[:view]
+
+    new_mount_point? = changed?(assigns, :view) or changed?(assigns, :id)
+
+    llv =
+      %{main: false, url: nil}
+      |> Map.merge(assigns[:__llv__] || %{})
+      |> Map.put(:new_mount_point, new_mount_point?)
+
+    assigns = assign(assigns, id: assigns[:id] || default_id(view), __llv__: llv)
+
+    if mirror_exists?(view) do
+      ~H"""
+      <.live_component module={__MODULE__.Mirrored} {assigns} />
+      """
+    else
+      render_static(assigns)
+    end
+  end
+
+  defp render_static(assigns) do
+    comp_assigns = comp_assigns(assigns)
+    ssr_html = if assigns.__llv__.new_mount_point, do: ssr_html(assigns, nil), else: nil
+
+    assigns =
+      assign(assigns,
+        mirror_token: nil,
+        mirror_id: nil,
+        comp_assigns: comp_assigns,
+        ssr_html: ssr_html,
+        main: assigns.__llv__.main
+      )
+
+    render_markup(assigns)
+  end
+
+  defmodule Mirrored do
+    @moduledoc false
+    use Phoenix.LiveComponent
+    alias LocalLiveView.Component, as: LLVComponent
+
+    @impl true
+    def update(assigns, socket) do
+      view = assigns[:view]
+
+      mirror_id =
+        case socket.assigns[:mirror_id] do
+          nil -> LLVComponent.mirror_id(socket, assigns.id)
+          mirror_id -> mirror_id
+        end
+
+      mirror_token =
+        cond do
+          token = socket.assigns[:mirror_token] ->
+            token
+
+          Phoenix.LiveView.connected?(socket) ->
+            endpoint = socket.endpoint || LLVComponent.resolve_default_endpoint()
+            LocalLiveView.MirrorToken.sign(endpoint, view, mirror_id)
+
+          true ->
+            nil
+        end
+
+      comp_assings = LLVComponent.comp_assigns(assigns)
+
+      # Decided by local_live_view/1, see there
+      ssr_html =
+        if assigns.__llv__.new_mount_point,
+          do: LLVComponent.ssr_html(assigns, mirror_id),
+          else: nil
+
+      socket =
+        assign(socket,
+          view: view,
+          id: assigns.id,
+          mirror_token: mirror_token,
+          mirror_id: mirror_id,
+          comp_assigns: comp_assings,
+          ssr_html: ssr_html,
+          main: assigns.__llv__.main
+        )
+
+      {:ok, socket}
+    end
+
+    @impl true
+    def render(assigns) do
+      LLVComponent.render_markup(assigns)
+    end
+  end
+
+  @doc false
+  defp validate_assigns!(assigns) do
+    view = assigns[:view]
+
+    unless is_binary(view) do
+      raise ArgumentError, """
+      <.local_live_view> expects view="..." parameter to be a string, got:
+        #{inspect(view)}
+      """
+    end
+
+    if Map.has_key?(assigns, :inner_block) do
+      raise ArgumentError, "<.local_live_view> does not accept inner content"
+    end
+  end
+
+  @doc false
+  def render_markup(assigns) do
+    validate_assigns!(assigns)
+
+    ~H"""
+    <div
+      id={"#{@id}-llv-hook"}
+      phx-hook="LocalLiveView"
+      phx-update="ignore"
+      data-pop-view={@view}
+      data-pop-id={@id}
+      data-pop-assigns={encode_assigns(@comp_assigns)}
+      data-pop-mirror-token={@mirror_token}
+      data-pop-mirror-id={@mirror_id}
+      data-pop-main={@main}
+    >
+    <%!-- Mark the div as inert so that events triggered before WASM takes over don't reach the server  --%>
+    <div id={"#{@id}-llv-root"} data-pop-root data-pop-ssr={@ssr_html != nil} inert={@ssr_html != nil}>{Phoenix.HTML.raw(@ssr_html)}</div>
+    <%!-- Stub for sending events from client to server. See LLVEngine class. --%>
+    <div id={"#{@id}-llv-event-bus"} data-llv-event-bus-for={@id} phx-hook="LocalLiveViewEventBus" hidden>
+    </div>
+    </div>
+    """
+  end
+
+  @doc false
+  def comp_assigns(assigns) do
+    Map.drop(assigns, [:__changed__, :__llv__, :view, :llv_ssr])
+  end
+
+  # Renders the view on the server; nil when disabled or not possible.
+  @doc false
+  def ssr_html(assigns, mirror_id) do
+    view = assigns[:view]
+
+    if Map.get(assigns, :llv_ssr, Application.get_env(:local_live_view, :ssr, true)) do
+      opts = %{
+        view: view,
+        assigns: comp_assigns(assigns),
+        id: assigns.id,
+        main: assigns.__llv__.main,
+        url: assigns.__llv__.url,
+        mirror_id: mirror_id
+      }
+
+      case LocalLiveView.SSR.render(opts) do
+        {:ok, html} ->
+          html
+
+        {:error, :not_loaded} ->
+          Logger.debug("LLV #{view}: not rendered on the server, module not available")
+          nil
+
+        {:error, :redirected} ->
+          nil
+      end
+    end
+  rescue
+    e ->
+      Logger.error("""
+      LLV #{assigns[:view]}: rendering on the server failed, the view is left for the browser \
+      to render. Guard browser-only code with LocalLiveView.connected?/1 or disable server \
+      rendering with llv_ssr={false}.
+      #{Exception.format(:error, e, __STACKTRACE__)}\
+      """)
+
+      nil
+  end
+
+  defp encode_assigns(assigns), do: Base.encode64(:erlang.term_to_binary(assigns))
+
+  @doc false
+  def resolve_default_endpoint do
+    Application.get_env(:local_live_view, :default_endpoint)
+  end
+
+  @doc """
+  Assembles the deterministic `mirror_id` for a given LocalLiveView component
+  within a parent LiveView process.
+
+  Accepts the parent `socket` (or directly its `socket.id`), and either:
+  * a default ID derived from view name
+  * an explicit custom DOM ID provided to `<.local_live_view id="..." />`
+
+  ## Examples
+
+      # Explicit ID passed to component:
+      mirror_id = LocalLiveView.Component.mirror_id(socket, "my-custom-cart")
+
+      # Default ID derived from view name:
+      mirror_id = LocalLiveView.Component.mirror_id(socket, "llv-Cart")
+  """
+  @spec mirror_id(Phoenix.LiveView.Socket.t(), String.t()) :: String.t()
+  def mirror_id(%Phoenix.LiveView.Socket{id: socket_id}, id) do
+    mirror_id(socket_id, id)
+  end
+
+  def mirror_id(socket_id, id) when is_binary(socket_id) and is_binary(id) do
+    socket_id <> "-" <> id
+  end
+
+  defp default_id(name) when is_binary(name) do
+    "llv-" <> String.replace(name, ~r/[^A-Za-z0-9_-]/, "-")
+  end
+
+  defp mirror_exists?(view_name), do: LocalLiveView.Mirror.find_module(view_name) != nil
+end

@@ -1,0 +1,202 @@
+defmodule Popcorn.JS.Error do
+  @moduledoc """
+  Raised by `Popcorn.JS.run!/3` when JavaScript fails or the reply times out.
+
+  The `:reason` field contains the reason from the `{:error, reason}` result of `Popcorn.JS.run/3`.
+  """
+
+  @type t :: %__MODULE__{reason: :timeout | {:js, term()}}
+
+  defexception [:reason]
+
+  @impl true
+  def message(%__MODULE__{reason: :timeout}), do: "JS didn't reply in time"
+
+  def message(%__MODULE__{reason: {:js, reason}}), do: "JS raised: '#{format(reason)}'"
+
+  defp format(reason) when is_binary(reason), do: reason
+  defp format(reason), do: inspect(reason)
+end
+
+defmodule Popcorn.JS.Mock do
+  @moduledoc false
+
+  def await_ready(_opts), do: :ok
+  def run_js(_code, _args, _opts), do: nil
+  def send(_message), do: :ok
+end
+
+defmodule Popcorn.JS do
+  @moduledoc """
+  Connects Elixir processes to JavaScript in the browser page.
+
+  ## Receiving messages
+
+  JavaScript calls to `popcorn.send(target, payload)` deliver `{:wasm, payload}` to the target process.
+  Use `is_message/1` in guards to match it.
+  Use `Popcorn.Proxy` for GenServer calls and casts.
+
+  ## Values
+
+  Messages and `run/3` arguments and results are converted between Elixir and JavaScript.
+  See [Sharing values across languages](values.md) for supported types and conversions.
+  Use a `t:tracked_value/0` to keep a JavaScript value's identity.
+
+  ## Outside the browser
+
+  Use `available?/0` to check if your code is running natively or in the browser.
+  On a native VM, JavaScript calls use a no-op mock so Popcorn applications can run in tests.
+  """
+
+  # The runtime provides `:wasm`, so the compiler never sees it. Silencing the
+  # warning here means code calling this module compiles without doing the same.
+  @compile {:no_warn_undefined, :wasm}
+
+  @typedoc """
+  An opaque handle that keeps a JavaScript value alive.
+
+  Return `new TrackedValue(value, cleanup)` from a JavaScript function to create a handle.
+  The cleanup function has the signature `() => void`.
+  Pass the handle in `run/3` arguments to access the original value.
+
+  The runtime calls the `cleanup` function after BEAM garbage collection releases the handle, or when the VM stops.
+
+  Note:
+  Garbage collection does not guarantee prompt cleanup.
+  For time-sensitive resources, call an idempotent cleanup function explicitly. This ensures you can call it yourself or it can be called by Popcorn.
+  """
+  @opaque tracked_value :: {:wasm_tracked_value, reference()}
+
+  @typedoc """
+  A JavaScript message with a payload decoded into Elixir terms.
+  """
+  @type message :: {:wasm, payload :: term()}
+
+  @type run_opts :: [{:timeout, timeout()}]
+
+  @doc """
+  Matches a `t:message/0` sent from JavaScript.
+  """
+  defguard is_message(message)
+           when is_tuple(message) and tuple_size(message) == 2 and elem(message, 0) == :wasm
+
+  @doc """
+  Returns `true` if running in the browser.
+  """
+  @spec available?() :: boolean()
+  def available? do
+    Code.ensure_loaded?(:wasm) and function_exported?(:wasm, :run_js, 3)
+  end
+
+  @doc """
+  Waits until the JavaScript `Popcorn` instance has finished booting.
+
+  Use this only from asynchronous work whose process startup has already been
+  acknowledged, such as the body of a supervised `Task`:
+
+  ```elixir
+  children = [
+    {Task, &MyApp.API.run/0}
+  ]
+
+  def run do
+    with :ok <- Popcorn.JS.await_ready(),
+         {:ok, _value} <- Popcorn.JS.run("() => initializeBrowser()") do
+      :ok
+    end
+  end
+  ```
+
+  ## Options
+
+  - `:timeout` - the reply timeout, or `:infinity`. Defaults to `5_000` ms.
+
+  ## Notes
+  - Do not call this function from `Application.start/2`, `c:GenServer.init/1`, a
+  child `start_link` path that has not returned, or an OTP start phase — it will deadlock.
+
+
+  """
+  @spec await_ready(run_opts()) :: :ok | {:error, :timeout}
+  def await_ready(opts \\ []) when is_list(opts) do
+    bridge().await_ready(opts)
+  catch
+    :error, :await_ready_timeout -> {:error, :timeout}
+  end
+
+  @doc """
+  Runs a JavaScript function on the page and waits for its result.
+
+  `code` defines a function with the signature `(args, {send, call, cast}) => result`.
+  The bridge converts the `args` map to JavaScript values and awaits any returned promise.
+  It returns `{:ok, value}` with the result converted to Elixir terms or `{:error, {:js, reason}}`.
+  A timeout returns `{:error, :timeout}` and does not cancel JavaScript execution.
+
+  The page's Content Security Policy must permit JavaScript evaluation with `unsafe-eval`.
+
+  ## JS
+
+  The `send` helper sends a message to a BEAM process.
+  The `call` and `cast` helpers use `Popcorn.Proxy` to contact GenServers.
+  These helpers return values or reject on failure, like their [JavaScript API](JSLib.Popcorn.html) counterparts.
+  Use `trySend`, `tryCall`, or `tryCast` to receive result objects for expected failures.
+
+  Notes:
+  - Calls during application startup run before `popcorn.boot()` resolves.
+  - Do not await a `call` to the process that executes `run/3`. It will cause deadlocks.
+
+  ## Options
+
+  - `:timeout` - the reply timeout, or `:infinity`. Defaults to `5_000` ms.
+
+  ## Examples
+
+  ```elixir
+  Popcorn.JS.run("({n}) => n + 1", %{n: 1})
+  #=> {:ok, 2}
+  ```
+
+  Use a `t:tracked_value/0` for values such as DOM elements:
+
+  ```elixir
+  {:ok, element} = Popcorn.JS.run("() => new TrackedValue(document.body)")
+  Popcorn.JS.run!("({element}) => { element.textContent = 'Ready'; }", %{element: element})
+  ```
+  """
+  @spec run(String.t(), map(), run_opts()) ::
+          {:ok, term()} | {:error, :timeout | {:js, term()}}
+  def run(code, args \\ %{}, opts \\ []) when is_binary(code) and is_map(args) do
+    {:ok, bridge().run_js(code, args, opts)}
+  catch
+    # Bridge own errors. `rescue` normalizes into structs which we *don't* want.
+    :error, :run_js_timeout -> {:error, :timeout}
+    :error, {:run_js, reason} -> {:error, {:js, reason}}
+  end
+
+  @doc """
+  See `run/3`.
+  """
+  @spec run!(String.t(), map(), run_opts()) :: term()
+  def run!(code, args \\ %{}, opts \\ []) when is_binary(code) and is_map(args) do
+    case run(code, args, opts) do
+      {:ok, value} -> value
+      {:error, reason} -> raise Popcorn.JS.Error, reason: reason
+    end
+  end
+
+  @doc """
+  Sends a message to the JavaScript callbacks registered with `popcorn.onEvent()`.
+  """
+  @spec send(term()) :: :ok
+  def send(message) do
+    bridge().send(message)
+  end
+
+  defp bridge do
+    Application.get_env(:popcorn, :wasm_bridge) || default_bridge()
+  end
+
+  defp default_bridge do
+    if available?(), do: :wasm, else: Popcorn.JS.Mock
+  end
+end
